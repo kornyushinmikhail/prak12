@@ -1,0 +1,422 @@
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import numpy as np
+import open3d as o3d
+from PIL import Image, ImageFilter
+
+
+MAX_IMAGE_SIZE = 800
+POINT_STEP = 2
+
+
+def load_image(filename):
+    """
+    Загрузка изображения через Pillow.
+
+    Поддерживаются PNG, JPG, JPEG, BMP,
+    TIFF, WebP и другие форматы Pillow.
+    """
+
+    try:
+        image = Image.open(filename)
+        image = image.convert("RGB")
+
+    except Exception as error:
+        raise ValueError(
+            f"Не удалось открыть изображение:\n{error}"
+        )
+
+    return image
+
+
+def resize_image(image):
+    """
+    Уменьшение изображения, если оно слишком большое.
+    """
+
+    width, height = image.size
+
+    if max(width, height) <= MAX_IMAGE_SIZE:
+        return image
+
+    scale = MAX_IMAGE_SIZE / max(
+        width,
+        height
+    )
+
+    new_size = (
+        int(width * scale),
+        int(height * scale)
+    )
+
+    return image.resize(
+        new_size,
+        Image.Resampling.LANCZOS
+    )
+
+
+def make_depth_map(image):
+    """
+    Создание приближённой карты глубины.
+
+    Глубина рассчитывается на основе:
+    - яркости;
+    - локального контраста;
+    - границ изображения.
+
+    Это не метрическая глубина.
+    """
+
+    image_array = np.asarray(
+        image,
+        dtype=np.float32
+    )
+
+    gray = (
+        0.299 * image_array[:, :, 0]
+        + 0.587 * image_array[:, :, 1]
+        + 0.114 * image_array[:, :, 2]
+    )
+
+    gray = gray / 255.0
+
+    blurred_image = image.filter(
+        ImageFilter.GaussianBlur(radius=2)
+    )
+
+    blurred_array = np.asarray(
+        blurred_image,
+        dtype=np.float32
+    )
+
+    blurred_gray = (
+        0.299 * blurred_array[:, :, 0]
+        + 0.587 * blurred_array[:, :, 1]
+        + 0.114 * blurred_array[:, :, 2]
+    )
+
+    blurred_gray = blurred_gray / 255.0
+
+    contrast = np.abs(
+        gray - blurred_gray
+    )
+
+    maximum_contrast = np.max(
+        contrast
+    )
+
+    if maximum_contrast > 0:
+        contrast = (
+            contrast
+            / maximum_contrast
+        )
+
+    edges_x = np.zeros_like(gray)
+    edges_y = np.zeros_like(gray)
+
+    edges_x[:, 1:] = np.abs(
+        gray[:, 1:]
+        - gray[:, :-1]
+    )
+
+    edges_y[1:, :] = np.abs(
+        gray[1:, :]
+        - gray[:-1, :]
+    )
+
+    edges = (
+        edges_x
+        + edges_y
+    )
+
+    edges = np.clip(
+        edges,
+        0.0,
+        1.0
+    )
+
+    depth = (
+        0.65 * (1.0 - gray)
+        + 0.20 * edges
+        + 0.15 * contrast
+    )
+
+    return np.clip(
+        depth,
+        0.01,
+        1.0
+    )
+
+
+def save_depth_map(filename, depth):
+    """
+    Сохранение карты глубины в формате PNG.
+    """
+
+    depth_image = (
+        depth * 255
+    ).astype(np.uint8)
+
+    image = Image.fromarray(
+        depth_image,
+        mode="L"
+    )
+
+    image.save(filename)
+
+
+def create_point_cloud(image, depth):
+    """
+    Создание цветного облака точек Open3D.
+    """
+
+    image_array = np.asarray(
+        image,
+        dtype=np.float32
+    ) / 255.0
+
+    height, width = depth.shape
+
+    y, x = np.indices(
+        (height, width)
+    )
+
+    x = x[::POINT_STEP, ::POINT_STEP]
+    y = y[::POINT_STEP, ::POINT_STEP]
+
+    z = depth[
+        ::POINT_STEP,
+        ::POINT_STEP
+    ]
+
+    colors = image_array[
+        ::POINT_STEP,
+        ::POINT_STEP
+    ]
+
+    focal_length = float(
+        max(width, height)
+    )
+
+    center_x = width / 2.0
+    center_y = height / 2.0
+
+    x_3d = (
+        (x - center_x)
+        * z
+        / focal_length
+    )
+
+    y_3d = (
+        (y - center_y)
+        * z
+        / focal_length
+    )
+
+    points = np.stack(
+        (
+            x_3d,
+            -y_3d,
+            z
+        ),
+        axis=-1
+    )
+
+    points = points.reshape(
+        (-1, 3)
+    )
+
+    colors = colors.reshape(
+        (-1, 3)
+    )
+
+    valid_points = np.isfinite(
+        points
+    ).all(axis=1)
+
+    points = points[
+        valid_points
+    ]
+
+    colors = colors[
+        valid_points
+    ]
+
+    cloud = o3d.geometry.PointCloud()
+
+    cloud.points = (
+        o3d.utility.Vector3dVector(points)
+    )
+
+    cloud.colors = (
+        o3d.utility.Vector3dVector(colors)
+    )
+
+    return cloud
+
+
+def save_point_cloud(filename, cloud):
+    """
+    Сохранение облака точек в формате PLY.
+    """
+
+    result = o3d.io.write_point_cloud(
+        str(filename),
+        cloud,
+        write_ascii=True
+    )
+
+    if not result:
+        raise IOError(
+            "Не удалось сохранить файл PLY."
+        )
+
+
+def choose_image():
+    """
+    Выбор изображения.
+    """
+
+    return filedialog.askopenfilename(
+        title="Выберите изображение",
+        filetypes=[
+            (
+                "Изображения",
+                "*.png *.jpg *.jpeg *.bmp "
+                "*.tif *.tiff *.webp"
+            ),
+            ("PNG", "*.png"),
+            ("JPEG", "*.jpg *.jpeg"),
+            ("BMP", "*.bmp"),
+            ("TIFF", "*.tif *.tiff"),
+            ("WebP", "*.webp"),
+            ("Все файлы", "*.*")
+        ]
+    )
+
+
+def process_image():
+    """
+    Основная функция обработки.
+    """
+
+    filename = choose_image()
+
+    if not filename:
+        return
+
+    try:
+        input_path = Path(filename)
+
+        image = load_image(
+            filename
+        )
+
+        image = resize_image(
+            image
+        )
+
+        depth = make_depth_map(
+            image
+        )
+
+        depth_filename = input_path.with_name(
+            input_path.stem + "_depth.png"
+        )
+
+        cloud_filename = input_path.with_name(
+            input_path.stem + "_point_cloud.ply"
+        )
+
+        save_depth_map(
+            depth_filename,
+            depth
+        )
+
+        cloud = create_point_cloud(
+            image,
+            depth
+        )
+
+        save_point_cloud(
+            cloud_filename,
+            cloud
+        )
+
+        messagebox.showinfo(
+            "Готово",
+            "Обработка завершена.\n\n"
+            f"Карта глубины:\n{depth_filename}\n\n"
+            f"Облако точек:\n{cloud_filename}\n\n"
+            f"Количество точек: {len(cloud.points)}"
+        )
+
+        o3d.visualization.draw_geometries(
+            [cloud],
+            window_name="Цветное облако точек"
+        )
+
+    except Exception as error:
+        messagebox.showerror(
+            "Ошибка",
+            str(error)
+        )
+
+
+def main():
+    window = tk.Tk()
+
+    window.title(
+        "Создание 3D-облака точек"
+    )
+
+    window.geometry(
+        "520x270"
+    )
+
+    window.resizable(
+        False,
+        False
+    )
+
+    title = tk.Label(
+        window,
+        text="Создание 3D-облака точек",
+        font=("Arial", 16)
+    )
+
+    title.pack(
+        pady=25
+    )
+
+    description = tk.Label(
+        window,
+        text=(
+            "Загрузите PNG, JPG, BMP, TIFF или WebP.\n"
+            "OpenCV в программе не используется."
+        )
+    )
+
+    description.pack(
+        pady=10
+    )
+
+    button = tk.Button(
+        window,
+        text="Загрузить изображение",
+        command=process_image,
+        width=30,
+        height=2
+    )
+
+    button.pack(
+        pady=20
+    )
+
+    window.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,3 +1,4 @@
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import numpy as np
@@ -47,14 +48,15 @@ def get_depth(img):
     if contrast.max() > 0:
         contrast = contrast / contrast.max()
 
-    # ищем границы простым способом - разница соседних пикселей
+    # ищем границы через векторные операции NumPy (вместо медленного
+    # попиксельного Python-цикла — см. PROFILING.md, ускорение в разы)
     h, w = gray.shape
-    edges = np.zeros((h, w))
-    for i in range(1, h):
-        for j in range(1, w):
-            dx = abs(gray[i][j] - gray[i][j - 1])
-            dy = abs(gray[i][j] - gray[i - 1][j])
-            edges[i][j] = dx + dy
+    edges = np.zeros((h, w), dtype=np.float32)
+
+    dx = np.abs(gray[1:, 1:] - gray[1:, :-1])
+    dy = np.abs(gray[1:, 1:] - gray[:-1, 1:])
+
+    edges[1:, 1:] = dx + dy
     edges = np.clip(edges, 0, 1)
 
     # итоговая глубина - чем темнее пиксель тем он как бы ближе
@@ -74,26 +76,27 @@ def make_point_cloud(img, depth):
     colors_arr = np.array(img).astype(np.float32) / 255
     h, w = depth.shape
 
-    points = []
-    colors = []
-
     focal = max(w, h)
     cx = w / 2
     cy = h / 2
 
-    # идём по пикселям с шагом STEP и считаем 3D координаты
-    for i in range(0, h, STEP):
-        for j in range(0, w, STEP):
-            z = depth[i][j]
-            x = (j - cx) * z / focal
-            y = (i - cy) * z / focal
+    # берём точки с шагом STEP через срезы NumPy вместо Python-циклов
+    # с append (это ещё и убирает лишний рост списков в памяти)
+    ys = np.arange(0, h, STEP)
+    xs = np.arange(0, w, STEP)
 
-            points.append([x, -y, z])
-            colors.append(colors_arr[i][j])
+    jj, ii = np.meshgrid(xs, ys)
+
+    z = depth[ii, jj]
+    x = (jj - cx) * z / focal
+    y = (ii - cy) * z / focal
+
+    points = np.stack([x, -y, z], axis=-1).reshape(-1, 3)
+    colors = colors_arr[ii, jj].reshape(-1, 3)
 
     cloud = o3d.geometry.PointCloud()
-    cloud.points = o3d.utility.Vector3dVector(np.array(points))
-    cloud.colors = o3d.utility.Vector3dVector(np.array(colors))
+    cloud.points = o3d.utility.Vector3dVector(points)
+    cloud.colors = o3d.utility.Vector3dVector(colors)
 
     return cloud
 
@@ -111,7 +114,11 @@ def process():
         img = load_image(filename)
         img = resize_image(img)
 
+        # замер времени выполнения для профилирования (см. PROFILING.md)
+        start_time = time.time()
         depth = get_depth(img)
+        elapsed = time.time() - start_time
+        print(f"[PROFILING] get_depth выполнилась за {elapsed:.3f} сек")
 
         # обрезаем расширение файла и делаем новые имена
         name_without_ext = filename.rsplit(".", 1)[0]
@@ -147,12 +154,3 @@ btn = tk.Button(window, text="Выбрать изображение", command=pr
 btn.pack(pady=20)
 
 window.mainloop()
-
-
-
-
-
-
-
-
-
